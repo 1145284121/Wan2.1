@@ -1,11 +1,14 @@
 """
-nsys profile -t cuda,nvtx --force-overwrite true \
-    -o attention_block python test_attention_block_profile.py
+Usage:  python test_attention_block_profile.py <experiment>
+  experiment: 1_baseline | 2_vectorized | 3_compile_default | 4_compile_fullgraph
+
+Each run is wrapped by nsys externally via run_all_profiles.sh
 """
 
+import sys
 import torch
 import torch.cuda.amp as amp
-import torch.cuda.nvtx as nvtx
+import nvtx
 import wan.modules.model as M
 from wan.modules.model import WanAttentionBlock, rope_params
 
@@ -29,12 +32,29 @@ inputs = dict(
     context_lens=None,
 )
 
-rope_eager = M.rope_apply
-rope_compiled = torch.compile(M.rope_apply, mode="default")
+
+@amp.autocast(enabled=False)
+def rope_apply_old(x, f, h, w, freqs):
+    """Original loop-based rope_apply, adapted to new (x, f, h, w, freqs) signature."""
+    n, c = x.size(2), x.size(3) // 2
+    seq_len = f * h * w
+    freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
+    output = []
+    for i in range(x.size(0)):
+        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
+            seq_len, n, -1, 2))
+        freqs_i = torch.cat([
+            freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
+            freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        ], dim=-1).reshape(seq_len, 1, -1)
+        x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
+        x_i = torch.cat([x_i, x[i, seq_len:]])
+        output.append(x_i)
+    return torch.stack(output).float()
 
 
-def set_rope(fn):
-    M.rope_apply = fn
+rope_vectorized = M.rope_apply
 
 
 def run(tag):
@@ -49,8 +69,24 @@ def run(tag):
     torch.cuda.synchronize()
 
 
-set_rope(rope_eager)
-run("baseline")
+exp = sys.argv[1]
 
-set_rope(rope_compiled)
-run("compiled_rope")
+if exp == "1_baseline":
+    M.rope_apply = rope_apply_old
+    run("baseline")
+
+elif exp == "2_vectorized":
+    M.rope_apply = rope_vectorized
+    run("vectorized")
+
+elif exp == "3_compile_default":
+    M.rope_apply = torch.compile(rope_vectorized, mode="default")
+    run("compile_default")
+
+elif exp == "4_compile_fullgraph":
+    M.rope_apply = torch.compile(rope_vectorized, mode="default", fullgraph=True)
+    run("compile_fullgraph")
+
+else:
+    print(f"Unknown experiment: {exp}")
+    sys.exit(1)
