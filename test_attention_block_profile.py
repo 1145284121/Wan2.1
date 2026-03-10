@@ -6,11 +6,13 @@ nsys profile -t cuda,nvtx --force-overwrite true \
 import torch
 import torch.cuda.amp as amp
 import torch.cuda.nvtx as nvtx
+import wan.modules.model as M
 from wan.modules.model import WanAttentionBlock, rope_params
 
 B, L, D, FFN_D, HEADS = 1, 4096, 2048, 8192, 16
 GRID = (4, 32, 32)
 DTYPE = torch.bfloat16
+WARMUP, REPEATS = 5, 20
 
 block = WanAttentionBlock("t2v_cross_attn", D, FFN_D, HEADS).cuda().to(DTYPE).eval()
 
@@ -27,10 +29,28 @@ inputs = dict(
     context_lens=None,
 )
 
-for _ in range(5):
-    with torch.no_grad(), amp.autocast(dtype=DTYPE):
-        block(**inputs)
+rope_eager = M.rope_apply
+rope_compiled = torch.compile(M.rope_apply, mode="default")
 
-for i in range(20):
-    with torch.no_grad(), amp.autocast(dtype=DTYPE), nvtx.annotate(f"iter_{i}"):
-        block(**inputs)
+
+def set_rope(fn):
+    M.rope_apply = fn
+
+
+def run(tag):
+    for _ in range(WARMUP):
+        with torch.no_grad(), amp.autocast(dtype=DTYPE):
+            block(**inputs)
+    torch.cuda.synchronize()
+
+    for i in range(REPEATS):
+        with torch.no_grad(), amp.autocast(dtype=DTYPE), nvtx.annotate(f"{tag}/iter_{i}"):
+            block(**inputs)
+    torch.cuda.synchronize()
+
+
+set_rope(rope_eager)
+run("baseline")
+
+set_rope(rope_compiled)
+run("compiled_rope")
