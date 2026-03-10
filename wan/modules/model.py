@@ -3,6 +3,7 @@ import math
 
 import torch
 import torch.cuda.amp as amp
+import torch.cuda.nvtx as nvtx
 import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
@@ -146,10 +147,12 @@ class WanSelfAttention(nn.Module):
 
         q, k, v = qkv_fn(x)
 
+        with nvtx.annotate("rope_apply"):
+            q = rope_apply(q, grid_sizes, freqs)
+            k = rope_apply(k, grid_sizes, freqs)
+
         x = flash_attention(
-            q=rope_apply(q, grid_sizes, freqs),
-            k=rope_apply(k, grid_sizes, freqs),
-            v=v,
+            q=q, k=k, v=v,
             k_lens=seq_lens,
             window_size=self.window_size)
 
@@ -299,21 +302,23 @@ class WanAttentionBlock(nn.Module):
         assert e[0].dtype == torch.float32
 
         # self-attention
-        y = self.self_attn(
-            self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
-            freqs)
-        with amp.autocast(dtype=torch.float32):
-            x = x + y * e[2]
+        with nvtx.annotate("self_attn"):
+            y = self.self_attn(
+                self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
+                freqs)
+            with amp.autocast(dtype=torch.float32):
+                x = x + y * e[2]
 
-        # cross-attention & ffn function
-        def cross_attn_ffn(x, context, context_lens, e):
+        # cross-attention
+        with nvtx.annotate("cross_attn"):
             x = x + self.cross_attn(self.norm3(x), context, context_lens)
+
+        # ffn
+        with nvtx.annotate("ffn"):
             y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
             with amp.autocast(dtype=torch.float32):
                 x = x + y * e[5]
-            return x
 
-        x = cross_attn_ffn(x, context, context_lens, e)
         return x
 
 
