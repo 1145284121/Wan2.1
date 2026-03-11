@@ -1,6 +1,6 @@
 """
 Usage:  python test_attention_block_profile.py <experiment>
-  experiment: 1_baseline | 2_vectorized | 3_compile_default | 4_compile_fullgraph
+  experiment: 1_baseline | 2_vectorized | 3_compile_default | 4_compile_fullgraph | 5_triton
 
 Each run is wrapped by nsys externally via run_all_profiles.sh
 """
@@ -11,6 +11,7 @@ import torch.cuda.amp as amp
 import nvtx
 import wan.modules.model as M
 from wan.modules.model import WanAttentionBlock, rope_params
+from wan.modules.rope_triton import rope_apply_triton
 
 B, L, D, FFN_D, HEADS = 1, 4096, 2048, 8192, 16
 GRID = (4, 32, 32)
@@ -86,6 +87,10 @@ elif exp == "3_compile_default":
 elif exp == "4_compile_fullgraph":
     M.rope_apply = torch.compile(rope_vectorized, mode="default", fullgraph=True)
     run("compile_fullgraph")
+
+elif exp == "5_triton":
+    M.rope_apply = rope_apply_triton
+    run("triton")
 
 else:
     print(f"Unknown experiment: {exp}")
